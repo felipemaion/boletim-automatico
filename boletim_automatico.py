@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-import imaplib
-import email
-import requests
 import os
 import json
-import time
+import email
+import imaplib
 import logging
-import fcntl
+import requests
+import platform
 from pathlib import Path
 from email.header import decode_header
 from dotenv import load_dotenv
@@ -34,6 +33,26 @@ TELEGRAM_MSG_LIMIT = 4000
 BODY_PREVIEW_LIMIT = 1200
 MAX_STORED_UIDS = 5000
 
+# =========================
+# LOCK BACKEND
+# =========================
+IS_WINDOWS = platform.system() == "Windows"
+
+try:
+    if IS_WINDOWS:
+        raise ImportError("Forçando fallback para filelock no Windows")
+    import fcntl
+    LOCK_BACKEND = "fcntl"
+except ImportError:
+    try:
+        from filelock import FileLock, Timeout
+        LOCK_BACKEND = "filelock"
+    except ImportError:
+        raise RuntimeError(
+            "Nenhum backend de lock disponível. "
+            "No Linux/macOS use fcntl nativo. "
+            "No Windows instale 'filelock'."
+        )
 
 # =========================
 # LOG
@@ -46,14 +65,14 @@ formatter = logging.Formatter(
     "%Y-%m-%d %H:%M:%S"
 )
 
-file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+if not logger.handlers:
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
-stream_handler = logging.StreamHandler()
-stream_handler.setFormatter(formatter)
-logger.addHandler(stream_handler)
-
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
 
 # =========================
 # UTILITÁRIOS
@@ -162,9 +181,6 @@ def enviar_telegram(mensagem):
         raise RuntimeError(f"Erro retornado pelo Telegram: {data}")
 
 
-# =========================
-# DEDUPLICAÇÃO
-# =========================
 def carregar_uids_processados():
     if not STATE_FILE.exists():
         return []
@@ -172,9 +188,7 @@ def carregar_uids_processados():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, list):
-                return data
-            return []
+            return data if isinstance(data, list) else []
     except Exception as e:
         logger.warning(f"Não foi possível ler {STATE_FILE.name}: {e}")
         return []
@@ -182,7 +196,6 @@ def carregar_uids_processados():
 
 def salvar_uids_processados(uids):
     try:
-        # mantém somente os mais recentes
         uids = uids[-MAX_STORED_UIDS:]
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(uids, f, ensure_ascii=False, indent=2)
@@ -190,35 +203,47 @@ def salvar_uids_processados(uids):
         logger.error(f"Falha ao salvar {STATE_FILE.name}: {e}")
         raise
 
-
 # =========================
-# LOCK
+# LOCK ABSTRATO
 # =========================
 class SingleInstanceLock:
     def __init__(self, path):
-        self.path = path
+        self.path = str(path)
         self.handle = None
+        self.filelock = None
 
     def __enter__(self):
-        self.handle = open(self.path, "w", encoding="utf-8")
-        try:
-            fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.handle.write(str(os.getpid()))
-            self.handle.flush()
-            return self
-        except BlockingIOError:
-            raise RuntimeError("Outra instância do script já está em execução.")
+        if LOCK_BACKEND == "fcntl":
+            self.handle = open(self.path, "w", encoding="utf-8")
+            try:
+                fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.handle.write(str(os.getpid()))
+                self.handle.flush()
+                logger.info("Lock adquirido com fcntl.")
+                return self
+            except BlockingIOError:
+                self.handle.close()
+                raise RuntimeError("Outra instância do script já está em execução.")
+        else:
+            self.filelock = FileLock(self.path + ".winlock", timeout=0)
+            try:
+                self.filelock.acquire()
+                logger.info("Lock adquirido com filelock.")
+                return self
+            except Timeout:
+                raise RuntimeError("Outra instância do script já está em execução.")
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            if self.handle:
+            if LOCK_BACKEND == "fcntl" and self.handle:
                 self.handle.seek(0)
                 self.handle.truncate()
                 fcntl.flock(self.handle, fcntl.LOCK_UN)
                 self.handle.close()
+            elif LOCK_BACKEND == "filelock" and self.filelock:
+                self.filelock.release()
         except Exception:
             pass
-
 
 # =========================
 # IMAP
@@ -243,7 +268,7 @@ def processar():
     uids_processados = carregar_uids_processados()
     uids_processados_set = set(uids_processados)
 
-    logger.info("Iniciando verificação de e-mails.")
+    logger.info(f"Iniciando verificação de e-mails. Backend de lock: {LOCK_BACKEND}")
 
     mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     try:
