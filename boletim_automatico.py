@@ -18,6 +18,7 @@ ENV_FILE = BASE_DIR / ".env"
 LOG_FILE = BASE_DIR / "email_telegram.log"
 LOCK_FILE = BASE_DIR / "email_telegram.lock"
 STATE_FILE = BASE_DIR / "processed_uids.json"
+USERS_FILE = BASE_DIR / "usuarios.json"  # 🔥 NOVO
 
 load_dotenv(ENV_FILE)
 
@@ -73,6 +74,44 @@ if not logger.handlers:
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
+
+# =========================
+# 🔥 NOVAS FUNÇÕES (multiusuário)
+# =========================
+def carregar_usuarios():
+    if not USERS_FILE.exists():
+        return []
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return []
+
+
+def salvar_usuarios(usuarios):
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(usuarios, f, indent=2)
+
+
+def capturar_usuarios():
+    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+    response = requests.get(url, timeout=10).json()
+
+    usuarios = carregar_usuarios()
+
+    for update in response.get("result", []):
+        try:
+            mensagem = update["message"]["text"]
+            chat_id = update["message"]["chat"]["id"]
+
+            if mensagem == "/start" and chat_id not in usuarios:
+                usuarios.append(chat_id)
+                logger.info(f"Novo usuário: {chat_id}")
+
+        except:
+            continue
+
+    salvar_usuarios(usuarios)
 
 # =========================
 # UTILITÁRIOS
@@ -166,19 +205,34 @@ def dividir_em_blocos(texto, limite=TELEGRAM_MSG_LIMIT):
     return blocos
 
 
+# 🔥 ALTERADO (multiusuário)
 def enviar_telegram(mensagem):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    dados = {
-        "chat_id": CHAT_ID,
-        "text": mensagem,
-    }
+    usuarios = carregar_usuarios()
 
-    resp = requests.post(url, data=dados, timeout=(5, 20))
-    resp.raise_for_status()
+    if not usuarios and CHAT_ID:
+        usuarios = [CHAT_ID]
 
-    data = resp.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Erro retornado pelo Telegram: {data}")
+    if not usuarios:
+        logger.warning("Nenhum usuário cadastrado.")
+        return
+
+    for chat_id in usuarios:
+        try:
+            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            dados = {
+                "chat_id": chat_id,
+                "text": mensagem,
+            }
+
+            resp = requests.post(url, data=dados, timeout=(5, 20))
+            resp.raise_for_status()
+
+            data = resp.json()
+            if not data.get("ok"):
+                raise RuntimeError(f"Erro retornado pelo Telegram: {data}")
+
+        except Exception as e:
+            logger.error(f"Erro ao enviar para {chat_id}: {e}")
 
 
 def carregar_uids_processados():
@@ -264,6 +318,7 @@ def buscar_email_por_uid(mail, uid):
 
 def processar():
     validar_env()
+    capturar_usuarios()  # 🔥 NOVO
 
     uids_processados = carregar_uids_processados()
     uids_processados_set = set(uids_processados)
