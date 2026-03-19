@@ -4,6 +4,7 @@ import json
 import email
 import imaplib
 import logging
+import re
 import requests
 import platform
 from pathlib import Path
@@ -199,17 +200,50 @@ def extrair_corpo_texto(msg):
     if html_content:
         soup = BeautifulSoup(html_content, "html.parser")
 
-        # remove scripts e estilos
-        for tag in soup(["script", "style"]):
+        # remove lixo: scripts, estilos, head, imagens, inputs, iframes
+        for tag in soup(["script", "style", "head", "img", "input",
+                         "iframe", "noscript", "svg", "meta", "link"]):
             tag.decompose()
+
+        # remove elementos ocultos (display:none, hidden, width/height 0/1)
+        for tag in soup.find_all(True):
+            style = (tag.get("style") or "").lower()
+            if "display:none" in style or "display: none" in style:
+                tag.decompose()
+                continue
+            if tag.get("hidden") is not None:
+                tag.decompose()
+                continue
+            # tracking pixels e spacers (tabelas 1x1, etc)
+            w = tag.get("width", "")
+            h = tag.get("height", "")
+            if w in ("0", "1") or h in ("0", "1"):
+                tag.decompose()
+                continue
+
+        # links → texto (url) — só exibe URL se for http e diferente do texto
+        for a in soup.find_all("a", href=True):
+            texto_link = a.get_text(strip=True)
+            href = a["href"].strip()
+            if not href.startswith(("http://", "https://")):
+                a.replace_with(texto_link)
+            elif texto_link and texto_link != href:
+                a.replace_with(f"{texto_link} ({href})")
+            elif href:
+                a.replace_with(href)
 
         texto = soup.get_text(separator="\n")
 
-        # limpa espaços e linhas vazias
+        # limpa espaços por linha e colapsa linhas vazias
         linhas = [linha.strip() for linha in texto.splitlines()]
-        linhas = [linha for linha in linhas if linha]
+        # remove linhas duplicadas consecutivas em branco
+        resultado = []
+        for linha in linhas:
+            if linha == "" and (not resultado or resultado[-1] == ""):
+                continue
+            resultado.append(linha)
 
-        return "\n".join(linhas)
+        return "\n".join(resultado).strip()
 
     return ""
 
