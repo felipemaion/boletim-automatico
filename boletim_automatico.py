@@ -4,12 +4,13 @@ import json
 import email
 import imaplib
 import logging
+import re
 import requests
 import platform
 from pathlib import Path
 from email.header import decode_header
 from dotenv import load_dotenv
-
+from bs4 import BeautifulSoup
 # =========================
 # CONFIGURAÇÃO DE CAMINHOS
 # =========================
@@ -18,6 +19,7 @@ ENV_FILE = BASE_DIR / ".env"
 LOG_FILE = BASE_DIR / "email_telegram.log"
 LOCK_FILE = BASE_DIR / "email_telegram.lock"
 STATE_FILE = BASE_DIR / "processed_uids.json"
+USERS_FILE = BASE_DIR / "usuarios.json"  # 🔥 NOVO
 
 load_dotenv(ENV_FILE)
 
@@ -75,6 +77,44 @@ if not logger.handlers:
     logger.addHandler(stream_handler)
 
 # =========================
+# 🔥 NOVAS FUNÇÕES (multiusuário)
+# =========================
+def carregar_usuarios():
+    if not USERS_FILE.exists():
+        return []
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return []
+
+
+def salvar_usuarios(usuarios):
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(usuarios, f, indent=2)
+
+
+def capturar_usuarios():
+    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+    response = requests.get(url, timeout=10).json()
+
+    usuarios = carregar_usuarios()
+
+    for update in response.get("result", []):
+        try:
+            mensagem = update["message"]["text"]
+            chat_id = update["message"]["chat"]["id"]
+
+            if mensagem == "/start" and chat_id not in usuarios:
+                usuarios.append(chat_id)
+                logger.info(f"Novo usuário: {chat_id}")
+
+        except:
+            continue
+
+    salvar_usuarios(usuarios)
+
+# =========================
 # UTILITÁRIOS
 # =========================
 def validar_env():
@@ -109,6 +149,9 @@ def decodificar_cabecalho(valor):
 
 
 def extrair_corpo_texto(msg):
+    html_content = None
+    text_content = None
+
     if msg.is_multipart():
         for part in msg.walk():
             content_type = part.get_content_type()
@@ -117,23 +160,90 @@ def extrair_corpo_texto(msg):
             if "attachment" in disposition:
                 continue
 
-            if content_type == "text/plain":
-                payload = part.get_payload(decode=True)
-                charset = part.get_content_charset() or "utf-8"
-                if payload:
-                    return payload.decode(charset, errors="replace").strip()
+            payload = part.get_payload(decode=True)
+            charset = part.get_content_charset() or "utf-8"
 
-        for part in msg.walk():
-            if part.get_content_type() == "text/html":
-                payload = part.get_payload(decode=True)
-                charset = part.get_content_charset() or "utf-8"
-                if payload:
-                    return payload.decode(charset, errors="replace").strip()
+            if not payload:
+                continue
+
+            try:
+                decoded = payload.decode(charset, errors="replace")
+            except:
+                decoded = payload.decode("utf-8", errors="replace")
+
+            if content_type == "text/plain":
+                text_content = decoded
+
+            elif content_type == "text/html":
+                html_content = decoded
+
     else:
         payload = msg.get_payload(decode=True)
         charset = msg.get_content_charset() or "utf-8"
+
         if payload:
-            return payload.decode(charset, errors="replace").strip()
+            try:
+                decoded = payload.decode(charset, errors="replace")
+            except:
+                decoded = payload.decode("utf-8", errors="replace")
+
+            if msg.get_content_type() == "text/plain":
+                text_content = decoded
+            else:
+                html_content = decoded
+
+    # 🔥 PRIORIDADE: usar texto puro se existir
+    if text_content:
+        return text_content.strip()
+
+    # 🔥 SENÃO: limpar HTML
+    if html_content:
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        # remove lixo: scripts, estilos, head, imagens, inputs, iframes
+        for tag in soup(["script", "style", "head", "img", "input",
+                         "iframe", "noscript", "svg", "meta", "link"]):
+            tag.decompose()
+
+        # remove elementos ocultos (display:none, hidden, width/height 0/1)
+        for tag in soup.find_all(True):
+            style = (tag.get("style") or "").lower()
+            if "display:none" in style or "display: none" in style:
+                tag.decompose()
+                continue
+            if tag.get("hidden") is not None:
+                tag.decompose()
+                continue
+            # tracking pixels e spacers (tabelas 1x1, etc)
+            w = tag.get("width", "")
+            h = tag.get("height", "")
+            if w in ("0", "1") or h in ("0", "1"):
+                tag.decompose()
+                continue
+
+        # links → texto (url) — só exibe URL se for http e diferente do texto
+        for a in soup.find_all("a", href=True):
+            texto_link = a.get_text(strip=True)
+            href = a["href"].strip()
+            if not href.startswith(("http://", "https://")):
+                a.replace_with(texto_link)
+            elif texto_link and texto_link != href:
+                a.replace_with(f"{texto_link} ({href})")
+            elif href:
+                a.replace_with(href)
+
+        texto = soup.get_text(separator="\n")
+
+        # limpa espaços por linha e colapsa linhas vazias
+        linhas = [linha.strip() for linha in texto.splitlines()]
+        # remove linhas duplicadas consecutivas em branco
+        resultado = []
+        for linha in linhas:
+            if linha == "" and (not resultado or resultado[-1] == ""):
+                continue
+            resultado.append(linha)
+
+        return "\n".join(resultado).strip()
 
     return ""
 
@@ -150,7 +260,17 @@ def dividir_em_blocos(texto, limite=TELEGRAM_MSG_LIMIT):
     atual = ""
 
     for linha in texto.splitlines(True):
-        if len(atual) + len(linha) > limite:
+        if len(linha) > limite:
+            # Linha maior que o limite: quebra no meio
+            if atual:
+                blocos.append(atual)
+                atual = ""
+            while len(linha) > limite:
+                blocos.append(linha[:limite])
+                linha = linha[limite:]
+            if linha:
+                atual = linha
+        elif len(atual) + len(linha) > limite:
             if atual:
                 blocos.append(atual)
             atual = linha
@@ -166,19 +286,34 @@ def dividir_em_blocos(texto, limite=TELEGRAM_MSG_LIMIT):
     return blocos
 
 
+# 🔥 ALTERADO (multiusuário)
 def enviar_telegram(mensagem):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    dados = {
-        "chat_id": CHAT_ID,
-        "text": mensagem,
-    }
+    usuarios = carregar_usuarios()
 
-    resp = requests.post(url, data=dados, timeout=(5, 20))
-    resp.raise_for_status()
+    if not usuarios and CHAT_ID:
+        usuarios = [CHAT_ID]
 
-    data = resp.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Erro retornado pelo Telegram: {data}")
+    if not usuarios:
+        logger.warning("Nenhum usuário cadastrado.")
+        return
+
+    for chat_id in usuarios:
+        try:
+            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            dados = {
+                "chat_id": chat_id,
+                "text": mensagem,
+            }
+
+            resp = requests.post(url, data=dados, timeout=(5, 20))
+            resp.raise_for_status()
+
+            data = resp.json()
+            if not data.get("ok"):
+                raise RuntimeError(f"Erro retornado pelo Telegram: {data}")
+
+        except Exception as e:
+            logger.error(f"Erro ao enviar para {chat_id}: {e}")
 
 
 def carregar_uids_processados():
@@ -264,6 +399,7 @@ def buscar_email_por_uid(mail, uid):
 
 def processar():
     validar_env()
+    capturar_usuarios()  # 🔥 NOVO
 
     uids_processados = carregar_uids_processados()
     uids_processados_set = set(uids_processados)
@@ -298,7 +434,7 @@ def processar():
 
                 remetente = decodificar_cabecalho(msg.get("From"))
                 assunto = decodificar_cabecalho(msg.get("Subject"))
-                corpo = resumir_texto(extrair_corpo_texto(msg))
+                corpo = extrair_corpo_texto(msg)
 
                 mensagem = (
                     "📧 Novo e-mail recebido\n\n"
@@ -307,7 +443,11 @@ def processar():
                     f"{corpo or '(sem corpo em texto)'}"
                 )
 
-                for bloco in dividir_em_blocos(mensagem):
+                blocos = dividir_em_blocos(mensagem)
+                total = len(blocos)
+                for i, bloco in enumerate(blocos, 1):
+                    if total > 1:
+                        bloco = f"[{i}/{total}]\n{bloco}"
                     enviar_telegram(bloco)
 
                 uids_processados.append(uid)
